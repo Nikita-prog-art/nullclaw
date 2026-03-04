@@ -544,6 +544,9 @@ pub const SqliteAnnVectorStore = struct {
     min_candidates: u32 = ANN_DEFAULT_MIN_CANDIDATES,
 
     const Self = @This();
+    const ANN_SYNC_SAVEPOINT_BEGIN: [:0]const u8 = "SAVEPOINT ann_sync";
+    const ANN_SYNC_SAVEPOINT_ROLLBACK: [:0]const u8 = "ROLLBACK TO SAVEPOINT ann_sync";
+    const ANN_SYNC_SAVEPOINT_RELEASE: [:0]const u8 = "RELEASE SAVEPOINT ann_sync";
 
     pub fn init(
         allocator: Allocator,
@@ -576,6 +579,34 @@ pub const SqliteAnnVectorStore = struct {
         }
     }
 
+    fn execSql(self: *Self, sql: [:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (rc != c.SQLITE_OK) {
+            if (err_msg) |msg| c.sqlite3_free(msg);
+            return error.ExecFailed;
+        }
+    }
+
+    fn execSqlIgnoreError(self: *Self, sql: [:0]const u8) void {
+        var err_msg: [*c]u8 = null;
+        _ = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (err_msg) |msg| c.sqlite3_free(msg);
+    }
+
+    fn rollbackAnnSyncSavepoint(self: *Self) void {
+        self.execSqlIgnoreError(ANN_SYNC_SAVEPOINT_ROLLBACK);
+        self.execSqlIgnoreError(ANN_SYNC_SAVEPOINT_RELEASE);
+    }
+
+    fn beginAnnSyncSavepoint(self: *Self) !void {
+        try self.execSql(ANN_SYNC_SAVEPOINT_BEGIN);
+    }
+
+    fn releaseAnnSyncSavepoint(self: *Self) !void {
+        try self.execSql(ANN_SYNC_SAVEPOINT_RELEASE);
+    }
+
     fn migrateAnn(self: *Self) !void {
         const ddl =
             \\CREATE TABLE IF NOT EXISTS memory_embedding_ann (
@@ -592,6 +623,9 @@ pub const SqliteAnnVectorStore = struct {
             \\CREATE INDEX IF NOT EXISTS idx_memory_embedding_ann_band2 ON memory_embedding_ann(band2);
             \\CREATE INDEX IF NOT EXISTS idx_memory_embedding_ann_band3 ON memory_embedding_ann(band3);
             \\DELETE FROM memory_embedding_ann WHERE memory_key NOT IN (SELECT memory_key FROM memory_embeddings);
+            \\DELETE FROM memory_embedding_ann WHERE memory_key IN (
+            \\  SELECT memory_key FROM memory_embeddings WHERE length(embedding) = 0 OR (length(embedding) % 4) != 0
+            \\);
         ;
         var err_msg: [*c]u8 = null;
         const rc = c.sqlite3_exec(self.db, ddl, null, null, &err_msg);
@@ -615,18 +649,33 @@ pub const SqliteAnnVectorStore = struct {
         return 0;
     }
 
-    fn backfillAnnIfNeeded(self: *Self) !void {
-        const emb_count = try self.countWithSql("SELECT COUNT(*) FROM memory_embeddings");
-        if (emb_count == 0) return;
+    fn countStaleAnnRows(self: *Self) !usize {
+        const stale_sql =
+            \\SELECT COUNT(*)
+            \\FROM memory_embeddings e
+            \\LEFT JOIN memory_embedding_ann a ON a.memory_key = e.memory_key
+            \\WHERE length(e.embedding) > 0
+            \\  AND (length(e.embedding) % 4) = 0
+            \\  AND (a.memory_key IS NULL OR a.updated_at < e.updated_at)
+        ;
+        return self.countWithSql(stale_sql);
+    }
 
-        const ann_count = try self.countWithSql("SELECT COUNT(*) FROM memory_embedding_ann");
-        if (ann_count >= emb_count) return;
+    fn backfillAnnIfNeeded(self: *Self) !void {
+        const stale_count = try self.countStaleAnnRows();
+        if (stale_count == 0) return;
 
         try self.rebuildAnnIndex();
     }
 
     fn rebuildAnnIndex(self: *Self) !void {
-        const select_sql = "SELECT memory_key, embedding FROM memory_embeddings";
+        const select_sql =
+            "SELECT e.memory_key, e.embedding " ++
+            "FROM memory_embeddings e " ++
+            "LEFT JOIN memory_embedding_ann a ON a.memory_key = e.memory_key " ++
+            "WHERE length(e.embedding) > 0 " ++
+            "AND (length(e.embedding) % 4) = 0 " ++
+            "AND (a.memory_key IS NULL OR a.updated_at < e.updated_at)";
         var select_stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &select_stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -691,8 +740,24 @@ pub const SqliteAnnVectorStore = struct {
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    fn deleteAnn(self: *Self, key: []const u8) !void {
+        const sql = "DELETE FROM memory_embedding_ann WHERE memory_key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
     fn implUpsert(ptr: *anyopaque, key: []const u8, embedding: []const f32) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        var savepoint_open = false;
+        try self.beginAnnSyncSavepoint();
+        savepoint_open = true;
+        errdefer if (savepoint_open) self.rollbackAnnSyncSavepoint();
 
         const blob = try vector.vecToBytes(self.allocator, embedding);
         defer self.allocator.free(blob);
@@ -709,7 +774,14 @@ pub const SqliteAnnVectorStore = struct {
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
 
-        try self.upsertAnn(key, simhashSignatureFromEmbedding(embedding));
+        if (embedding.len == 0) {
+            try self.deleteAnn(key);
+        } else {
+            try self.upsertAnn(key, simhashSignatureFromEmbedding(embedding));
+        }
+
+        try self.releaseAnnSyncSavepoint();
+        savepoint_open = false;
     }
 
     fn implSearch(ptr: *anyopaque, alloc: Allocator, query_embedding: []const f32, limit: u32) anyerror![]VectorResult {
@@ -795,27 +867,26 @@ pub const SqliteAnnVectorStore = struct {
 
     fn implDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        var savepoint_open = false;
+        try self.beginAnnSyncSavepoint();
+        savepoint_open = true;
+        errdefer if (savepoint_open) self.rollbackAnnSyncSavepoint();
 
         // Keep ANN side table in sync regardless of FK settings.
-        const ann_sql = "DELETE FROM memory_embedding_ann WHERE memory_key = ?1";
-        var ann_stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self.db, ann_sql, -1, &ann_stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(ann_stmt);
-
-        _ = c.sqlite3_bind_text(ann_stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
-        rc = c.sqlite3_step(ann_stmt);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
+        try self.deleteAnn(key);
 
         const sql = "DELETE FROM memory_embeddings WHERE memory_key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
-        rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
         _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        try self.releaseAnnSyncSavepoint();
+        savepoint_open = false;
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -878,6 +949,29 @@ pub const SqliteAnnVectorStore = struct {
 };
 
 // ── Tests ─────────────────────────────────────────────────────────
+
+fn testExecSql(db: ?*c.sqlite3, sql: [:0]const u8) !void {
+    var err_msg: [*c]u8 = null;
+    const rc = c.sqlite3_exec(db, sql, null, null, &err_msg);
+    if (rc != c.SQLITE_OK) {
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        return error.SqlExecFailed;
+    }
+}
+
+fn testQuerySingleText(allocator: Allocator, db: ?*c.sqlite3, sql: [:0]const u8) ![]u8 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_ROW) return error.RowNotFound;
+    const value_ptr = c.sqlite3_column_text(stmt, 0);
+    const value_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+    if (value_ptr == null) return error.NullTextValue;
+    return allocator.dupe(u8, value_ptr[0..value_len]);
+}
 
 test "init with in-memory sqlite" {
     var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
@@ -1179,6 +1273,124 @@ test "sqlite ann upsert and search basic path" {
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expect(results[0].score >= results[1].score);
     try std.testing.expect(results[0].score > 0.9);
+}
+
+test "sqlite ann backfill refreshes stale rows even when counts match" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var shared = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer shared.deinit();
+    try shared.store().upsert("stale_key", &[_]f32{ 1.0, 0.0, 0.0 });
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 64);
+    defer ann.deinit();
+
+    try testExecSql(mem.db,
+        \\UPDATE memory_embedding_ann
+        \\SET updated_at = '1970-01-01 00:00:00'
+        \\WHERE memory_key = 'stale_key'
+    );
+    try std.testing.expectEqual(@as(usize, 1), try ann.countStaleAnnRows());
+
+    try ann.backfillAnnIfNeeded();
+    try std.testing.expectEqual(@as(usize, 0), try ann.countStaleAnnRows());
+}
+
+test "sqlite ann upsert is atomic across embeddings and ann rows" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 64);
+    defer ann.deinit();
+
+    try testExecSql(mem.db,
+        \\CREATE TRIGGER fail_ann_insert BEFORE INSERT ON memory_embedding_ann
+        \\BEGIN
+        \\  SELECT RAISE(ABORT, 'forced ann insert failure');
+        \\END;
+    );
+    defer testExecSql(mem.db, "DROP TRIGGER IF EXISTS fail_ann_insert") catch {};
+
+    const s = ann.store();
+    var saw_error = false;
+    s.upsert("atomic_upsert_key", &[_]f32{ 1.0, 0.0, 0.0 }) catch |err| {
+        saw_error = true;
+        try std.testing.expect(err == error.StepFailed or err == error.ExecFailed);
+    };
+    try std.testing.expect(saw_error);
+
+    try std.testing.expectEqual(@as(usize, 0), try ann.countWithSql("SELECT COUNT(*) FROM memory_embeddings WHERE memory_key = 'atomic_upsert_key'"));
+    try std.testing.expectEqual(@as(usize, 0), try ann.countWithSql("SELECT COUNT(*) FROM memory_embedding_ann WHERE memory_key = 'atomic_upsert_key'"));
+}
+
+test "sqlite ann delete is atomic across embeddings and ann rows" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 64);
+    defer ann.deinit();
+
+    const s = ann.store();
+    try s.upsert("atomic_delete_key", &[_]f32{ 1.0, 0.0, 0.0 });
+    try std.testing.expectEqual(@as(usize, 1), try ann.countWithSql("SELECT COUNT(*) FROM memory_embeddings WHERE memory_key = 'atomic_delete_key'"));
+    try std.testing.expectEqual(@as(usize, 1), try ann.countWithSql("SELECT COUNT(*) FROM memory_embedding_ann WHERE memory_key = 'atomic_delete_key'"));
+
+    try testExecSql(mem.db,
+        \\CREATE TRIGGER fail_embeddings_delete BEFORE DELETE ON memory_embeddings
+        \\BEGIN
+        \\  SELECT RAISE(ABORT, 'forced embedding delete failure');
+        \\END;
+    );
+    defer testExecSql(mem.db, "DROP TRIGGER IF EXISTS fail_embeddings_delete") catch {};
+
+    var saw_error = false;
+    s.delete("atomic_delete_key") catch |err| {
+        saw_error = true;
+        try std.testing.expect(err == error.StepFailed or err == error.ExecFailed);
+    };
+    try std.testing.expect(saw_error);
+
+    try std.testing.expectEqual(@as(usize, 1), try ann.countWithSql("SELECT COUNT(*) FROM memory_embeddings WHERE memory_key = 'atomic_delete_key'"));
+    try std.testing.expectEqual(@as(usize, 1), try ann.countWithSql("SELECT COUNT(*) FROM memory_embedding_ann WHERE memory_key = 'atomic_delete_key'"));
+}
+
+test "sqlite ann backfill ignores non-indexable embeddings in stale detection" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var shared = SqliteSharedVectorStore.init(std.testing.allocator, mem.db);
+    defer shared.deinit();
+    try shared.store().upsert("good", &[_]f32{ 1.0, 0.0, 0.0 });
+    try testExecSql(mem.db, "INSERT OR REPLACE INTO memory_embeddings (memory_key, embedding, updated_at) VALUES ('bad', x'', datetime('now'))");
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 64);
+    defer ann.deinit();
+
+    try testExecSql(mem.db,
+        \\UPDATE memory_embeddings SET updated_at = '2000-01-01 00:00:00' WHERE memory_key = 'good';
+        \\UPDATE memory_embedding_ann SET updated_at = '2000-01-01 00:00:00' WHERE memory_key = 'good';
+    );
+    try std.testing.expectEqual(@as(usize, 0), try ann.countStaleAnnRows());
+
+    try ann.backfillAnnIfNeeded();
+
+    const updated_at = try testQuerySingleText(std.testing.allocator, mem.db, "SELECT updated_at FROM memory_embedding_ann WHERE memory_key = 'good'");
+    defer std.testing.allocator.free(updated_at);
+    try std.testing.expectEqualStrings("2000-01-01 00:00:00", updated_at);
+}
+
+test "sqlite ann upsert with empty embedding keeps ann table clean" {
+    var mem = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    var ann = try SqliteAnnVectorStore.init(std.testing.allocator, mem.db, 8, 64);
+    defer ann.deinit();
+
+    const s = ann.store();
+    try s.upsert("empty_ann_key", &.{});
+    try std.testing.expectEqual(@as(usize, 1), try ann.countWithSql("SELECT COUNT(*) FROM memory_embeddings WHERE memory_key = 'empty_ann_key'"));
+    try std.testing.expectEqual(@as(usize, 0), try ann.countWithSql("SELECT COUNT(*) FROM memory_embedding_ann WHERE memory_key = 'empty_ann_key'"));
 }
 
 test "round-trip: upsert then search finds the key" {
