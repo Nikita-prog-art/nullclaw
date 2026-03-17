@@ -1477,6 +1477,38 @@ test "resolveInboundRouteSessionKey matches non-primary maixcam account by chann
     try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
 }
 
+test "resolveInboundRouteSessionKey routes nostr direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "nostr-dm-agent",
+            .match = .{
+                .channel = "nostr",
+                .account_id = "default",
+                .peer = .{ .kind = .direct, .id = "pubkey-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "nostr",
+        .sender_id = "pubkey-42",
+        .chat_id = "pubkey-42",
+        .content = "ping",
+        .session_key = "nostr:pubkey-42",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:nostr-dm-agent:nostr:direct:pubkey-42", routed.?);
+}
+
 test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
     const allocator = std.testing.allocator;
     const bindings = [_]agent_routing.AgentBinding{
