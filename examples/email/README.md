@@ -22,7 +22,7 @@ channel runtime already built into `channels.external`.
 
 ## What Lives In The Companion Repo
 
-- IMAP polling / IDLE loop
+- IMAP polling-first receive loop
 - SMTP send + threaded replies
 - email HTML sanitization and prompt-injection defense
 - attachment extraction / saving
@@ -64,6 +64,7 @@ from the companion repo, for example:
             },
             "from_address": "agent@example.com",
             "allow_from": ["*@your-company.com"],
+            "attachment_save_dir": "/absolute/path/inside/runtime-state-dir/attachments",
             "state_file": "imap-connector-state.json"
           }
         }
@@ -72,6 +73,9 @@ from the companion repo, for example:
   }
 }
 ```
+
+If you enable attachment saving, prefer an absolute path under the account
+`runtime.state_dir`. Relative paths resolve against the nullclaw process cwd.
 
 ## Operator Flow
 

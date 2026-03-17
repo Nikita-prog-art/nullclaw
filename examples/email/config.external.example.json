@@ -28,7 +28,7 @@
             "allow_from": ["*@your-company.com"],
             "poll_interval_secs": 60,
             "max_body_length": 50000,
-            "attachment_save_dir": "workspace/docs",
+            "attachment_save_dir": "/absolute/path/inside/runtime-state-dir/attachments",
             "attachment_extensions": [".pdf", ".docx"],
             "state_file": "imap-connector-state.json"
           }
