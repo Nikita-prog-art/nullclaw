@@ -543,6 +543,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("thread_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.thread_id = v.string;
         }
+        if (pm.value.object.get("typing_recipient")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.typing_recipient = v.string;
+        }
         if (pm.value.object.get("is_dm")) |v| {
             if (v == .bool) parsed.fields.is_dm = v.bool;
         }
@@ -694,16 +697,29 @@ fn resolveTypingRecipient(
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
 ) ?[]u8 {
+    if (meta.typing_recipient) |recipient| {
+        if (recipient.len == 0) return null;
+        return allocator.dupe(u8, recipient) catch null;
+    }
+
     if (std.mem.eql(u8, channel_name, "slack")) {
         const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return null;
         return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
     }
 
-    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost") and !std.mem.eql(u8, channel_name, "teams")) {
-        return null;
-    }
     if (chat_id.len == 0) return null;
     return allocator.dupe(u8, chat_id) catch null;
+}
+
+fn resolveOutboundChannel(
+    registry: *const dispatch.ChannelRegistry,
+    channel_name: []const u8,
+    account_id: ?[]const u8,
+) ?channels_mod.Channel {
+    return if (account_id) |aid|
+        registry.findByNameAccount(channel_name, aid)
+    else
+        registry.findByName(channel_name);
 }
 
 fn sendInboundProcessingIndicator(
@@ -714,11 +730,7 @@ fn sendInboundProcessingIndicator(
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
 ) ?[]u8 {
-    const channel_opt = if (account_id) |aid|
-        registry.findByNameAccount(channel_name, aid)
-    else
-        registry.findByName(channel_name);
-    const ch = channel_opt orelse return null;
+    const ch = resolveOutboundChannel(registry, channel_name, account_id) orelse return null;
 
     const recipient = resolveTypingRecipient(allocator, channel_name, chat_id, meta) orelse return null;
     ch.startTyping(recipient) catch {
@@ -737,11 +749,7 @@ fn clearInboundProcessingIndicator(
 ) void {
     const target = recipient orelse return;
     defer allocator.free(target);
-    const channel_opt = if (account_id) |aid|
-        registry.findByNameAccount(channel_name, aid)
-    else
-        registry.findByName(channel_name);
-    const ch = channel_opt orelse return;
+    const ch = resolveOutboundChannel(registry, channel_name, account_id) orelse return;
     ch.stopTyping(target) catch {};
 }
 
@@ -772,12 +780,6 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
     };
-}
-
-fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or
-        std.mem.eql(u8, channel, "telegram") or
-        std.mem.eql(u8, channel, "dingtalk");
 }
 
 fn makeAssistantReplyOutbound(
@@ -811,11 +813,11 @@ fn makeAssistantReplyOutbound(
 }
 
 fn makeStreamingSinkForChannel(
-    channel: []const u8,
+    streaming_supported: bool,
     raw_sink: streaming.Sink,
     filter: *streaming.TagFilter,
 ) ?streaming.Sink {
-    if (!supportsStreamingOutbound(channel)) return null;
+    if (!streaming_supported) return null;
     filter.* = streaming.TagFilter.init(raw_sink);
     return filter.sink();
 }
@@ -861,7 +863,11 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = supportsStreamingOutbound(msg.channel);
+        const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+        const use_streaming_outbound = if (outbound_channel) |channel|
+            channel.supportsStreamingOutbound()
+        else
+            false;
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -876,7 +882,7 @@ fn inboundDispatcherThread(
                 .callback = publishStreamingChunk,
                 .ctx = @ptrCast(&streaming_ctx),
             };
-            stream_sink = makeStreamingSinkForChannel(msg.channel, raw_sink, &outbound_tag_filter);
+            stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
         }
 
         if (std.mem.eql(u8, msg.channel, "max")) {
@@ -1202,7 +1208,7 @@ test "computeBackoff saturating" {
     try std.testing.expectEqual(std.math.maxInt(u64), computeBackoff(std.math.maxInt(u64), std.math.maxInt(u64)));
 }
 
-test "makeStreamingSinkForChannel filters web chunks" {
+test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
     const Collector = struct {
         buf: [128]u8 = undefined,
         len: usize = 0,
@@ -1230,7 +1236,7 @@ test "makeStreamingSinkForChannel filters web chunks" {
 
     var collector = Collector{};
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("web", collector.sink(), &filter).?;
+    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
     sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
     sink.emitFinal();
 
@@ -1238,26 +1244,26 @@ test "makeStreamingSinkForChannel filters web chunks" {
     try std.testing.expect(collector.got_final);
 }
 
-test "makeStreamingSinkForChannel supports dingtalk" {
+test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("dingtalk", .{
+    const sink = makeStreamingSinkForChannel(true, .{
         .callback = Noop.callback,
         .ctx = undefined,
     }, &filter);
     try std.testing.expect(sink != null);
 }
 
-test "makeStreamingSinkForChannel returns null for unsupported channel" {
+test "makeStreamingSinkForChannel returns null when streaming is disabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("discord", .{
+    const sink = makeStreamingSinkForChannel(false, .{
         .callback = Noop.callback,
         .ctx = undefined,
     }, &filter);

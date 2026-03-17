@@ -5,7 +5,9 @@ This directory contains a reference adapter for `channels.external`:
 - `nullclaw-plugin-whatsapp-web`
   Converts the ExternalChannel JSON-RPC/stdio plugin protocol into the
   HTTP bridge contract from the whatsmeow example (`/health`, `/poll`, `/send`).
-  The adapter advertises `protocol_version=2` and `capabilities.health=true`
+  The adapter advertises `protocol_version=2`, `capabilities.health=true`,
+  `capabilities.streaming=false`,
+  `capabilities.send_rich=false`, and `capabilities.typing=false`
   in `get_manifest`.
   `config.bridge_url` must be `https://...` or loopback `http://127.0.0.1/...`.
 
@@ -46,6 +48,9 @@ Optional `config` keys understood by the adapter:
 Protocol notes:
 
 - `start.params.runtime` contains `name`, `account_id`, and host-owned `state_dir`
-- `send.params` contains nested `runtime` and `message` objects
+- `start.result` must return `started: true`; successful `send` calls must return `accepted: true`
+- `send.params` contains nested `runtime` and `message` objects; text uses `message.text`
 - `inbound_message.params` contains a nested `message` object
 - `health.result` must return `healthy` or explicit boolean health signals; `{}` is invalid
+- `inbound_message.params.message` uses `text`, not `content`
+- `send_rich` and typing RPCs are intentionally unsupported by this text-only bridge adapter

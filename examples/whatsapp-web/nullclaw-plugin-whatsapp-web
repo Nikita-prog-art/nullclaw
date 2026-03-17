@@ -109,6 +109,9 @@ class WhatsAppWebPlugin:
                 "protocol_version": 2,
                 "capabilities": {
                     "health": True,
+                    "streaming": False,
+                    "send_rich": False,
+                    "typing": False,
                 },
             }
         if method == "start":
@@ -217,7 +220,7 @@ class WhatsAppWebPlugin:
         if not target:
             raise JsonRpcError(-32602, "target is required")
 
-        message = str(message_payload.get("content") or "")
+        message = str(message_payload.get("text") or "")
         media = message_payload.get("media")
         if isinstance(media, list) and media:
             self.log("ignoring media attachments; bridge adapter is text-only")
@@ -312,13 +315,13 @@ class WhatsAppWebPlugin:
         self.notify(
             "inbound_message",
             {
-                "message": {
-                    "sender_id": sender,
-                    "chat_id": chat_id,
-                    "content": text,
-                    "session_key": session_key,
-                    "metadata": metadata,
-                }
+                    "message": {
+                        "sender_id": sender,
+                        "chat_id": chat_id,
+                        "text": text,
+                        "session_key": session_key,
+                        "metadata": metadata,
+                    }
             },
         )
 

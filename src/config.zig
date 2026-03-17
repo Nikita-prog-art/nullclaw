@@ -281,10 +281,14 @@ pub const Config = struct {
         return false;
     }
 
-    fn externalRuntimeNameConflicts(self: *const Config, runtime_name: []const u8) bool {
+    fn externalRuntimeNameConflicts(self: *const Config, runtime_name: []const u8, current_index: usize) bool {
         if (isReservedRuntimeChannelName(runtime_name)) return true;
         for (self.channels.maixcam) |maixcam_cfg| {
             if (std.mem.eql(u8, maixcam_cfg.name, runtime_name)) return true;
+        }
+        for (self.channels.external, 0..) |external_cfg, index| {
+            if (index == current_index) continue;
+            if (std.mem.eql(u8, external_cfg.runtime_name, runtime_name)) return true;
         }
         return false;
     }
@@ -1171,11 +1175,11 @@ pub const Config = struct {
                 }
             }
         }
-        for (self.channels.external) |external_cfg| {
+        for (self.channels.external, 0..) |external_cfg, index| {
             if (!config_types.ExternalChannelConfig.isValidRuntimeName(external_cfg.runtime_name)) {
                 return ValidationError.InvalidExternalRuntimeName;
             }
-            if (self.externalRuntimeNameConflicts(external_cfg.runtime_name)) {
+            if (self.externalRuntimeNameConflicts(external_cfg.runtime_name, index)) {
                 return ValidationError.ConflictingExternalRuntimeName;
             }
             if (!config_types.ExternalChannelConfig.hasCommand(external_cfg.transport.command)) {
@@ -2728,6 +2732,31 @@ test "validation rejects external runtime name that collides with maixcam runtim
         .allocator = std.testing.allocator,
         .channels = .{
             .maixcam = &maixcam_accounts,
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.ConflictingExternalRuntimeName, cfg.validate());
+}
+
+test "validation rejects duplicate external runtime names across accounts" {
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "whatsapp_web",
+            .transport = .{ .command = "plugin-a" },
+        },
+        .{
+            .account_id = "backup",
+            .runtime_name = "whatsapp_web",
+            .transport = .{ .command = "plugin-b" },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
             .external = &external_accounts,
         },
     };

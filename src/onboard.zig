@@ -1320,7 +1320,7 @@ fn parseWizardJsonConfig(allocator: std.mem.Allocator, raw: []const u8) ![]const
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.InvalidJson;
     defer parsed.deinit();
-    if (parsed.value != .object and parsed.value != .array) return error.InvalidJson;
+    if (parsed.value != .object) return error.InvalidJson;
     return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
@@ -1577,10 +1577,10 @@ fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: 
         return false;
     }
 
-    try out.print("{s}  External config JSON (optional, object/array): ", .{prefix});
+    try out.print("{s}  External config JSON (optional, object): ", .{prefix});
     const raw_config = prompt(out, &config_buf, "", "") orelse return false;
     plugin_config_json = parseWizardJsonConfig(cfg.allocator, raw_config) catch {
-        try out.print("{s}  -> External skipped (config JSON must be a valid object/array)\n", .{prefix});
+        try out.print("{s}  -> External skipped (config JSON must be a valid object)\n", .{prefix});
         return false;
     };
 
