@@ -1,0 +1,68 @@
+name: Release
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ZIG_VERSION: "0.15.2"
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (linux-x86_64)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: bash .github/scripts/install-zig.sh "${ZIG_VERSION}"
+
+      - name: Resolve build version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build ReleaseSmall
+        run: |
+          zig build \
+            -Doptimize=ReleaseSmall \
+            -Dtarget=x86_64-linux-musl \
+            -Dversion=${{ steps.version.outputs.value }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nullclaw-linux-x86_64
+          path: zig-out/bin/nullclaw
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+
+      - name: Rename binaries
+        run: |
+          mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nullclaw-linux-x86_64.bin
+          generate_release_notes: true
+
