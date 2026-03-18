@@ -29,8 +29,10 @@ pub const QwenCliCredentials = struct {
     }
 };
 
-const QWEN_OAUTH_TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token";
-const QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56";
+pub const QWEN_OAUTH_TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token";
+pub const QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56";
+pub const QWEN_OAUTH_DEVICE_URL = "https://chat.qwen.ai/api/v1/oauth2/device/code";
+pub const QWEN_OAUTH_SCOPE = "openid profile email offline_access";
 
 /// Resolve API key for a provider from config and environment variables.
 ///
@@ -180,7 +182,7 @@ pub fn parseQwenCredentialsJson(allocator: std.mem.Allocator, json_bytes: []cons
     };
 }
 
-fn writeQwenCredentialsJson(
+pub fn writeQwenCredentialsJson(
     allocator: std.mem.Allocator,
     creds: QwenCliCredentials,
     path: []const u8,

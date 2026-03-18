@@ -3493,60 +3493,102 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const codex = yc.providers.openai_codex;
     const auth_mod = yc.auth;
 
-    if (!std.mem.eql(u8, provider_name, "openai-codex")) {
+    if (!std.mem.eql(u8, provider_name, "openai-codex") and !std.mem.eql(u8, provider_name, "qwen-portal")) {
         std.debug.print("Unknown auth provider: {s}\n\n", .{provider_name});
         std.debug.print("Available providers:\n", .{});
         std.debug.print("  openai-codex    ChatGPT Plus/Pro subscription (OAuth)\n", .{});
+        std.debug.print("  qwen-portal     Qwen Portal subscription (OAuth)\n", .{});
         std.process.exit(1);
     }
 
     if (std.mem.eql(u8, subcmd, "login")) {
-        var import_codex = false;
-        for (rest) |arg| {
-            if (std.mem.eql(u8, arg, "--import-codex")) import_codex = true;
-        }
-
-        if (import_codex) {
-            runAuthImportCodex(allocator, codex, auth_mod);
+        if (std.mem.eql(u8, provider_name, "qwen-portal")) {
+            runAuthDeviceCodeLoginQwen(allocator, auth_mod);
         } else {
-            runAuthDeviceCodeLogin(allocator, codex, auth_mod);
+            var import_codex = false;
+            for (rest) |arg| {
+                if (std.mem.eql(u8, arg, "--import-codex")) import_codex = true;
+            }
+
+            if (import_codex) {
+                runAuthImportCodex(allocator, codex, auth_mod);
+            } else {
+                runAuthDeviceCodeLogin(allocator, codex, auth_mod);
+            }
         }
     } else if (std.mem.eql(u8, subcmd, "status")) {
-        if (auth_mod.loadCredential(allocator, codex.CREDENTIAL_KEY) catch null) |token| {
-            defer token.deinit(allocator);
-            std.debug.print("openai-codex: authenticated\n", .{});
-            if (token.expires_at != 0) {
-                const remaining = token.expires_at - std.time.timestamp();
-                if (remaining > 0) {
-                    std.debug.print("  Token expires in: {d}h {d}m\n", .{
-                        @divTrunc(remaining, 3600),
-                        @divTrunc(@mod(remaining, 3600), 60),
-                    });
-                } else {
-                    std.debug.print("  Token: expired (will auto-refresh)\n", .{});
+        if (std.mem.eql(u8, provider_name, "qwen-portal")) {
+            if (yc.providers.api_key.tryLoadQwenCliToken(allocator)) |creds| {
+                defer creds.deinit(allocator);
+                std.debug.print("qwen-portal: authenticated\n", .{});
+                if (creds.expiry_date_ms) |expires_at| {
+                    const remaining = @divTrunc(expires_at, 1000) - std.time.timestamp();
+                    if (remaining > 0) {
+                        std.debug.print("  Token expires in: {d}h {d}m\n", .{
+                            @divTrunc(remaining, 3600),
+                            @divTrunc(@mod(remaining, 3600), 60),
+                        });
+                    } else {
+                        std.debug.print("  Token: expired (will auto-refresh)\n", .{});
+                    }
                 }
+                if (creds.refresh_token != null) {
+                    std.debug.print("  Refresh token: present\n", .{});
+                }
+            } else {
+                std.debug.print("qwen-portal: not authenticated\n", .{});
+                std.debug.print("  Run `nullclaw auth login qwen-portal` to authenticate.\n", .{});
             }
-            if (token.refresh_token != null) {
-                std.debug.print("  Refresh token: present\n", .{});
-            }
-            const account_id = codex.extractAccountIdFromJwt(allocator, token.access_token) catch null;
-            defer if (account_id) |id| allocator.free(id);
-            if (account_id) |id| {
-                std.debug.print("  Account: {s}\n", .{id});
-            }
-        } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
-            std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
-            std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
-            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
         } else {
-            std.debug.print("openai-codex: not authenticated\n", .{});
-            std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
+            if (auth_mod.loadCredential(allocator, codex.CREDENTIAL_KEY) catch null) |token| {
+                defer token.deinit(allocator);
+                std.debug.print("openai-codex: authenticated\n", .{});
+                if (token.expires_at != 0) {
+                    const remaining = token.expires_at - std.time.timestamp();
+                    if (remaining > 0) {
+                        std.debug.print("  Token expires in: {d}h {d}m\n", .{
+                            @divTrunc(remaining, 3600),
+                            @divTrunc(@mod(remaining, 3600), 60),
+                        });
+                    } else {
+                        std.debug.print("  Token: expired (will auto-refresh)\n", .{});
+                    }
+                }
+                if (token.refresh_token != null) {
+                    std.debug.print("  Refresh token: present\n", .{});
+                }
+                const account_id = codex.extractAccountIdFromJwt(allocator, token.access_token) catch null;
+                defer if (account_id) |id| allocator.free(id);
+                if (account_id) |id| {
+                    std.debug.print("  Account: {s}\n", .{id});
+                }
+            } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
+                std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
+                std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
+                std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
+            } else {
+                std.debug.print("openai-codex: not authenticated\n", .{});
+                std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
+            }
         }
     } else if (std.mem.eql(u8, subcmd, "logout")) {
-        if (auth_mod.deleteCredential(allocator, codex.CREDENTIAL_KEY) catch false) {
-            std.debug.print("openai-codex: credentials removed.\n", .{});
+        if (std.mem.eql(u8, provider_name, "qwen-portal")) {
+            const home = yc.platform.getHomeDir(allocator) catch null;
+            if (home) |h| {
+                defer allocator.free(h);
+                const path = std.fs.path.join(allocator, &.{ h, ".qwen", "oauth_creds.json" }) catch null;
+                if (path) |p| {
+                    defer allocator.free(p);
+                    std.fs.deleteFileAbsolute(p) catch {};
+                    std.debug.print("qwen-portal: credentials removed.\n", .{});
+                }
+            }
         } else {
-            std.debug.print("openai-codex: no credentials found.\n", .{});
+            if (auth_mod.deleteCredential(allocator, codex.CREDENTIAL_KEY) catch false) {
+                std.debug.print("openai-codex: credentials removed.\n", .{});
+            } else {
+                std.debug.print("openai-codex: no credentials found.\n", .{});
+            }
         }
     } else {
         std.debug.print("Unknown auth command: {s}\n\n", .{subcmd});
@@ -3591,14 +3633,94 @@ fn printAuthUsage() void {
         \\
         \\Providers:
         \\  openai-codex    ChatGPT Plus/Pro subscription (OAuth)
+        \\  qwen-portal     Qwen Portal subscription (OAuth)
         \\
         \\Examples:
         \\  nullclaw auth login openai-codex
         \\  nullclaw auth login openai-codex --import-codex
         \\  nullclaw auth status openai-codex
         \\  nullclaw auth logout openai-codex
+        \\  nullclaw auth login qwen-portal
+        \\  nullclaw auth status qwen-portal
         \\
     , .{AUTH_SUBCOMMANDS}), .{});
+}
+
+fn runAuthDeviceCodeLoginQwen(
+    allocator: std.mem.Allocator,
+    auth_mod: type,
+) void {
+    std.debug.print("Starting Qwen Portal authentication...\n\n", .{});
+
+    const dc = auth_mod.startDeviceCodeFlow(
+        allocator,
+        yc.providers.api_key.QWEN_OAUTH_CLIENT_ID,
+        yc.providers.api_key.QWEN_OAUTH_DEVICE_URL,
+        yc.providers.api_key.QWEN_OAUTH_SCOPE,
+    ) catch {
+        std.debug.print("Failed to start device code flow.\n", .{});
+        std.process.exit(1);
+    };
+    defer dc.deinit(allocator);
+
+    std.debug.print("Open this URL in your browser:\n", .{});
+    std.debug.print("  {s}\n\n", .{dc.verification_uri});
+    std.debug.print("Enter code: {s}\n\n", .{dc.user_code});
+    std.debug.print("Waiting for authorization...\n", .{});
+
+    const token = auth_mod.pollDeviceCode(
+        allocator,
+        yc.providers.api_key.QWEN_OAUTH_TOKEN_ENDPOINT,
+        yc.providers.api_key.QWEN_OAUTH_CLIENT_ID,
+        dc.device_code,
+        dc.interval,
+    ) catch |err| {
+        switch (err) {
+            error.DeviceCodeDenied => std.debug.print("Authorization denied.\n", .{}),
+            error.DeviceCodeTimeout => std.debug.print("Authorization timed out.\n", .{}),
+            else => std.debug.print("Authorization failed: {}\n", .{err}),
+        }
+        std.process.exit(1);
+    };
+    defer token.deinit(allocator);
+
+    const creds = yc.providers.api_key.QwenCliCredentials{
+        .access_token = token.access_token,
+        .refresh_token = token.refresh_token,
+        .token_type = token.token_type,
+        .expiry_date_ms = if (token.expires_at > 0) std.math.mul(i64, token.expires_at, std.time.ms_per_s) catch null else null,
+    };
+
+    const home = yc.platform.getHomeDir(allocator) catch {
+        std.debug.print("Failed to get home dir.\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(home);
+    const qwen_dir = std.fs.path.join(allocator, &.{ home, ".qwen" }) catch {
+        std.debug.print("Failed to build qwen dir.\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(qwen_dir);
+    std.fs.makeDirAbsolute(qwen_dir) catch |err| switch(err) {
+        error.PathAlreadyExists => {},
+        else => {
+            std.debug.print("Failed to create qwen dir.\n", .{});
+            std.process.exit(1);
+        },
+    };
+    const path = std.fs.path.join(allocator, &.{ qwen_dir, "oauth_creds.json" }) catch {
+        std.debug.print("Failed to build creds path.\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(path);
+
+    yc.providers.api_key.writeQwenCredentialsJson(allocator, creds, path) catch {
+        std.debug.print("Failed to save Qwen credentials.\n", .{});
+        std.process.exit(1);
+    };
+
+    std.debug.print("Authenticated successfully.\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"qwen-portal/qwen-max\" in ~/.nullclaw/config.json\n", .{});
 }
 
 fn runAuthDeviceCodeLogin(
